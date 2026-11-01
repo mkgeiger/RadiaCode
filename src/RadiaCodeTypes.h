@@ -110,9 +110,11 @@ enum VSFR
 
     TEMP_UNITS           = 0x8016,
 
-    //CPS                = 0x8020,   not supported anymore ?!
-    //DR_uR_h            = 0x8021,   not supported anymore ?!
-    //DS_uR              = 0x8022,   not supported anymore ?!
+    // Live measurement registers (the author's "not supported anymore" comment
+    // is wrong; these read back valid values on the current firmware).
+    CPS                 = 0x8020,
+    DR_uR_h             = 0x8021,
+    DS_uR               = 0x8022,
 
     TEMP_degC            = 0x8024,
     //ACC_X              = 0x8025,   not supported anymore ?!
@@ -196,24 +198,64 @@ enum CTRL
     COUNT_RATE_OUT_OF_SCALE = 1 << 12
 };
 
-// Enum for Event IDs
+// Enum for Event IDs (values per the authoritative protocol reference)
 enum EventId
 {
-    POWER_OFF          = 0,
-    POWER_ON           = 1,
-    TOGGLE_SIGNAL      = 3,
-    EVENT_DOSE_RESET   = 4,
-    BATTERY_FULL       = 7,
-    CHARGE_STOP        = 8,
-    DOSE_RATE_ALARM1   = 9,
-    DOSE_RATE_ALARM2   = 10,
-    DOSE_ALARM1        = 12,
-    DOSE_ALARM2        = 13,
-    EVENT_TEXT_MESSAGE = 17,
-    SPECTRUM_RESET     = 19,
-    COUNT_RATE_ALARM1  = 20,
-    COUNT_RATE_ALARM2  = 21
+    POWER_OFF             = 0,
+    POWER_ON              = 1,
+    LOW_BATTERY_SHUTDOWN  = 2,
+    CHANGE_DEVICE_PARAMS  = 3,
+    EVENT_DOSE_RESET      = 4,
+    USER_EVENT            = 5,
+    BATTERY_EMPTY_ALARM   = 6,
+    CHARGE_START          = 7,   // e.g. a USB charger was plugged in
+    CHARGE_STOP           = 8,
+    DOSE_RATE_ALARM1      = 9,
+    DOSE_RATE_ALARM2      = 10,
+    DOSE_RATE_OFFSCALE    = 11,
+    DOSE_ALARM1           = 12,
+    DOSE_ALARM2           = 13,
+    DOSE_OFFSCALE         = 14,
+    TEMPERATURE_TOO_LOW   = 15,
+    TEMPERATURE_TOO_HIGH  = 16,
+    EVENT_TEXT_MESSAGE    = 17,
+    MEMORY_SNAPSHOT       = 18,    SPECTRUM_RESET        = 19,
+    COUNT_RATE_ALARM1     = 20,
+    COUNT_RATE_ALARM2     = 21,
+    COUNT_RATE_OFFSCALE   = 22
 };
+
+// Human-readable name for an event id, for console/display purposes.
+inline const char* eventIdName(EventId id)
+{
+    switch (id)
+    {
+        case POWER_OFF:            return "POWER_OFF";
+        case POWER_ON:             return "POWER_ON";
+        case LOW_BATTERY_SHUTDOWN: return "LOW_BATTERY_SHUTDOWN";
+        case CHANGE_DEVICE_PARAMS: return "CHANGE_DEVICE_PARAMS";
+        case EVENT_DOSE_RESET:     return "DOSE_RESET";
+        case USER_EVENT:           return "USER_EVENT";
+        case BATTERY_EMPTY_ALARM:  return "BATTERY_EMPTY_ALARM";
+        case CHARGE_START:         return "CHARGE_START";
+        case CHARGE_STOP:          return "CHARGE_STOP";
+        case DOSE_RATE_ALARM1:     return "DOSE_RATE_ALARM1";
+        case DOSE_RATE_ALARM2:     return "DOSE_RATE_ALARM2";
+        case DOSE_RATE_OFFSCALE:   return "DOSE_RATE_OFFSCALE";
+        case DOSE_ALARM1:          return "DOSE_ALARM1";
+        case DOSE_ALARM2:          return "DOSE_ALARM2";
+        case DOSE_OFFSCALE:        return "DOSE_OFFSCALE";
+        case TEMPERATURE_TOO_LOW:  return "TEMPERATURE_TOO_LOW";
+        case TEMPERATURE_TOO_HIGH: return "TEMPERATURE_TOO_HIGH";
+        case EVENT_TEXT_MESSAGE:   return "TEXT_MESSAGE";
+        case MEMORY_SNAPSHOT:      return "MEMORY_SNAPSHOT";
+        case SPECTRUM_RESET:       return "SPECTRUM_RESET";
+        case COUNT_RATE_ALARM1:    return "COUNT_RATE_ALARM1";
+        case COUNT_RATE_ALARM2:    return "COUNT_RATE_ALARM2";
+        case COUNT_RATE_OFFSCALE:  return "COUNT_RATE_OFFSCALE";
+        default:                   return "UNKNOWN";
+    }
+}
 
 // Enum for Display Control Flags
 enum DISPLAY_CTRL
@@ -248,8 +290,8 @@ enum MeasurementUnits
 // Enum for Count Rate Units
 enum CountRateUnits
 {
-    CPS = 0,
-    CPM = 1
+    CPS_UNIT = 0,
+    CPM_UNIT = 1
 };
 
 // Enum for Temperature Units

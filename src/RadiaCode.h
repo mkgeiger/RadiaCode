@@ -116,12 +116,28 @@ class RadiaCode
         // Direct sensor reading methods
         float getTemperature(void);
 
+        // Poll the device's current "vitals" (temperature, accumulated dose)
+        // via direct VSFR reads, for immediate values at connect instead of
+        // waiting for periodic RareData records. Battery charge has no VSFR and
+        // is only available from RareData. Each field has a _valid flag in case
+        // a given firmware does not implement the register.
+        struct DeviceVitals
+        {
+            float temperature;      // deg C
+            bool  temperature_valid;
+            uint32_t dose_raw;      // raw DS_uR value (uR)
+            float dose_uSv;         // accumulated dose converted to uSv
+            bool  dose_valid;
+            bool  dose_units_sv;    // DS_UNITS: true = Sv, false = R
+        };
+        DeviceVitals readDeviceVitals(void);
+
     private:
         // Low-level communication methods
         BytesBuffer execute(COMMAND reqtype, const uint8_t* args = nullptr, size_t args_len = 0);
         BytesBuffer readRequest(uint32_t command_id);
         void writeRequest(uint32_t command_id, const uint8_t* data = nullptr, size_t data_len = 0);
-        std::vector<float> batchReadVSFRs(const std::vector<uint32_t>& vsfr_ids);
+        std::vector<float> batchReadVSFRs(const std::vector<uint32_t>& vsfr_ids, bool quiet = false);
         uint32_t readVSFR(uint32_t vsfr_id);
 
         // Variables

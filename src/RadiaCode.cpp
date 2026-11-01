@@ -353,7 +353,7 @@ void RadiaCode::writeRequest(uint32_t command_id, const uint8_t* data, size_t da
 #endif
 }
 
-std::vector<float> RadiaCode::batchReadVSFRs(const std::vector<uint32_t>& vsfr_ids)
+std::vector<float> RadiaCode::batchReadVSFRs(const std::vector<uint32_t>& vsfr_ids, bool quiet)
 {
     std::vector<float> ret;
 
@@ -395,7 +395,10 @@ std::vector<float> RadiaCode::batchReadVSFRs(const std::vector<uint32_t>& vsfr_i
     if (valid_flags != expected_flags)
     {
 #ifdef RC_DEBUG_ERROR
-        RC_LOGE("Error: Unexpected validity flags, bad vsfr_id? 0x%X != 0x%X", (unsigned)valid_flags, (unsigned)expected_flags);
+        if (!quiet)
+        {
+            RC_LOGE("Error: Unexpected validity flags, bad vsfr_id? 0x%X != 0x%X", (unsigned)valid_flags, (unsigned)expected_flags);
+        }
 #endif
         return ret;
     }
@@ -488,6 +491,39 @@ float RadiaCode::getTemperature(void)
         return values[0];
     }
     return 0.0f;
+}
+
+RadiaCode::DeviceVitals RadiaCode::readDeviceVitals(void)
+{
+    DeviceVitals v = {};
+
+    // Temperature: TEMP_degC is a supported float VSFR.
+    std::vector<float> temp = batchReadVSFRs({VSFR::TEMP_degC});
+    if (temp.size() > 0)
+    {
+        v.temperature = temp[0];
+        v.temperature_valid = true;
+    }
+
+    // Dose units: DS_UNITS (1 byte, low byte) - true = Sv, false = R.
+    std::vector<float> units = batchReadVSFRs({VSFR::DS_UNITS}, true);
+    if (units.size() > 0)
+    {
+        v.dose_units_sv = (units[0] != 0.0f);
+    }
+
+    // Accumulated dose: DS_uR (uR). 1 uR = 0.01 uSv, so dose_uSv = raw / 100.
+    // Quiet: some firmware versions don't implement this register, and the
+    // "not supported anymore" comment on the VSFR may be right; skip it then.
+    std::vector<float> dose = batchReadVSFRs({VSFR::DS_uR}, true);
+    if (dose.size() > 0)
+    {
+        v.dose_raw = (uint32_t)dose[0];
+        v.dose_uSv = v.dose_raw / 100.0f;
+        v.dose_valid = true;
+    }
+
+    return v;
 }
 
 uint32_t RadiaCode::deviceStatus(void)
