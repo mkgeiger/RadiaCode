@@ -432,12 +432,31 @@ void BluetoothTransport::parseAvailableRecords(void)
 
     while (_buf_len > 0)
     {
+        if (_buf_len < 7)
+        {
+            break; // need more data (partial record header)
+        }
+
         BytesBuffer br(_resp_buffer, _buf_len);
         std::vector<DataItem*> items;
         size_t consumed_bytes = decodeDataBufRecord(br, _base_time_sec, items);
         if (consumed_bytes == 0)
         {
-            break; // need more data, or hit an unknown record type
+            // A full 7-byte header was present but the record failed to decode:
+            // assume it is corrupt and re-sync to the next plausible record so
+            // one glitch does not discard the rest of the stream.
+            if (!resyncDataBuf(br))
+            {
+                break; // need more data, or no further plausible record
+            }
+            size_t skip = br.getPosition();
+            if (skip == 0 || skip >= _buf_len)
+            {
+                break; // no forward progress - stop to avoid a spin loop
+            }
+            memmove(_resp_buffer, _resp_buffer + skip, _buf_len - skip);
+            _buf_len -= skip;
+            continue;
         }
 
         for (DataItem* item : items)

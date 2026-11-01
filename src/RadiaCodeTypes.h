@@ -275,8 +275,55 @@ class DataItem
 {
     public:
         virtual ~DataItem() {}
-        uint32_t timestamp;               // Unix timestamp
+        uint32_t timestamp;               // Unix timestamp (seconds)
+        uint16_t timestamp_ms;            // Millisecond fraction of the timestamp (0..999)
         DataItemType type = TYPE_UNKNOWN; // Item type for identification
+
+        // Raw DATA_BUF record header, preserved for diagnostics / debugging.
+        // ts_offset is in 0.01-second units relative to the device's pinned
+        // clock; record time = host_now_at_read + ts_offset*10 ms.
+        int32_t ts_offset = 0;
+        uint8_t eid = 0;
+        uint8_t gid = 0;
+
+        // Whether this record is historical/old data (the device sets the
+        // record-flags "Old data" bit on buffered/older records) rather than a
+        // current live measurement.  Defaults to false for record types that
+        // carry no flags (e.g. RawData bursts).
+        virtual bool isHistorical() const { return false; }
+};
+
+// Decoded interpretation of a DATA_BUF record's u16 `flags` field.
+//
+// These are a *different* bit table from the GET_STATUS device-status word.
+// Per the authoritative protocol reference, the u16 packs:
+//   - power source in bits 13-14,
+//   - temperature state in bits 6-7,
+//   - "Save to database" (bit 12) and "Old data" (bit 15),
+//   - the instantaneous alarm level of the measurement channel: dose-rate in
+//     bits 0-1, count-rate in bits 8-9 (set on DoseRateDB / Event records).
+//
+// `old_data()` distinguishes history from live records - the device marks
+// buffered/older records with it (confirmed in captured Android-app logs), so a
+// consumer can save history separately from current measurements.
+struct RecordFlags
+{
+    enum PowerSource { POWER_ACCUM = 0, POWER_USB = 1, POWER_USB_CHARGING = 2, POWER_ACCUM_LOW = 3 };
+    enum TempStatus  { TEMP_NOT_DEFINED = 0, TEMP_TOO_LOW = 2, TEMP_TOO_HIGH = 3 };
+
+    uint16_t value;
+
+    RecordFlags(uint16_t flags) : value(flags) {}
+
+    bool save_to_database() const { return (value & (1 << 12)) != 0; }
+    bool old_data() const         { return (value & (1 << 15)) != 0; }
+
+    // Active alarm levels, 0/1/2 (0 = none).
+    uint8_t dose_rate_alarm_level() const { return (value >> 0) & 0x03; }
+    uint8_t count_rate_alarm_level() const { return (value >> 8) & 0x03; }
+
+    PowerSource power_source() const { return static_cast<PowerSource>((value >> 13) & 0x03); }
+    TempStatus  temp_status() const  { return static_cast<TempStatus>((value >> 6) & 0x03); }
 };
 
 class RealTimeData : public DataItem
@@ -289,6 +336,8 @@ class RealTimeData : public DataItem
         float dose_rate_err;
         uint16_t flags;
         uint8_t real_time_flags;
+        RecordFlags recordFlags(void) const { return RecordFlags(flags); }
+        bool isHistorical() const override { return recordFlags().old_data(); }
 };
 
 class RawData : public DataItem
@@ -308,6 +357,8 @@ class DoseRateDB : public DataItem
         float dose_rate;
         float dose_rate_err;
         uint16_t flags;
+        RecordFlags recordFlags(void) const { return RecordFlags(flags); }
+        bool isHistorical() const override { return recordFlags().old_data(); }
 };
 
 class RareData : public DataItem
@@ -319,6 +370,8 @@ class RareData : public DataItem
         float temperature;
         float charge_level;
         uint16_t flags;
+        RecordFlags recordFlags(void) const { return RecordFlags(flags); }
+        bool isHistorical() const override { return recordFlags().old_data(); }
 };
 
 class DoseCounter : public DataItem
@@ -327,6 +380,8 @@ class DoseCounter : public DataItem
         DoseCounter() { type = TYPE_DOSE_COUNTER; }
         uint32_t dose_counter;
         uint16_t flags;
+        RecordFlags recordFlags(void) const { return RecordFlags(flags); }
+        bool isHistorical() const override { return recordFlags().old_data(); }
 };
 
 class Event : public DataItem
@@ -345,6 +400,7 @@ class Event : public DataItem
         float dose_rate = 0.0f;
         float dose_rate_err = 0.0f;
         bool has_dose_rate = false;
+        RecordFlags recordFlags(void) const { return RecordFlags(flags); }
 };
 
 struct Spectrum

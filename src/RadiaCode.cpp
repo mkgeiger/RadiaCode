@@ -97,9 +97,9 @@ RadiaCode::RadiaCode(const char* bluetooth_mac, bool ignore_firmware_compatibili
                 timeinfo->tm_sec, timeinfo->tm_min, timeinfo->tm_hour);
         }
         // Base time for timestamping DATA_BUF records. The device's ts_offset
-        // grows over the session (it is relative to connect time), so the base
-        // is fixed to host "now" at connect; decodeDataBufRecord() applies a
-        // +128s correction to live RealTimeData records only.
+        // is relative to connect time (it grows ~1s per session second), so the
+        // base is fixed to host "now" at connect and never refreshed; the
+        // decoder applies a +128s correction to live RealTimeData (gid 0).
         _base_time_sec = now;
     }
 
@@ -662,6 +662,15 @@ std::vector<DataItem*> RadiaCode::dataBuf(void)
     {
         return std::vector<DataItem*>();
     }
+
+    // The device timestamps DATA_BUF records relative to CONNECT time: raw
+    // ts_offset grows ~1s per second of session time (measured on hardware:
+    // ts_offset = elapsed_since_connect - 128 for live records). So the record
+    // base must be the host wall-clock at connect, FIXED for the whole session.
+    // Refreshing it per read adds elapsed time to every record, drifting
+    // timestamps into the future (see the ts_offset experiment).
+    //
+    // _base_time_sec is set to host "now" at connect in the constructor.
 
     // Enable streaming record parsing on the transport so a large DATA_BUF
     // response is decoded incrementally as BLE notifications arrive, instead

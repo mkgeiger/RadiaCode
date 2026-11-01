@@ -315,6 +315,105 @@ static bool isCountRateEvent(uint8_t event)
     return (event == 20) || (event == 21) || (event == 22);
 }
 
+// Return the body size (bytes after the 7-byte header) of a plausible record
+// whose header is at `off` in `data[0..n)`, or 0 if it does not look like a
+// valid record.  Mirrors the python reference `_record_size` so a corrupt
+// record can be re-synced past.
+static size_t recordBodySize(const uint8_t* data, size_t n, size_t off)
+{
+    if (off + 7 > n)
+    {
+        return 0;
+    }
+    uint8_t eid = data[off + 1];
+    uint8_t gid = data[off + 2];
+    size_t size = 0;
+
+    if (eid == 0)
+    {
+        if (gid <= 4)
+        {
+            size = gid0_single_payload[gid];
+        }
+        else if (gid == 7)
+        {
+            uint8_t event = data[off + 7];
+            size = 4 + (isRateEvent(event) ? 6 : 0);
+        }
+        else if (gid == 5 || gid == 6 || gid == 8 || gid == 9)
+        {
+            size = (gid == 5) ? 16 : 6; // ScheduleData 16, AccelData/RawRate 6
+        }
+        else
+        {
+            return 0;
+        }
+    }
+    else if (eid == 1)
+    {
+        size = gid1_sample_payload[gid]; // multi-sample per-sample payload size
+        if (size == 0)
+        {
+            return 0;
+        }
+        if (off + 13 > n)
+        {
+            return 0; // need samples_num before we can size the block
+        }
+        uint16_t samples_num = data[off + 7] | ((uint16_t)data[off + 8] << 8);
+        size_t body = 6 + size * samples_num;
+        if (off + 7 + body > n)
+        {
+            return 0;
+        }
+        return body;
+    }
+    else
+    {
+        return 0;
+    }
+
+    if (off + 7 + size > n)
+    {
+        return 0;
+    }
+    return size;
+}
+
+// After a malformed record, scan forward for the next plausible record header
+// and reposition the buffer there.  Returns true if a re-sync point was found,
+// leaving the buffer positioned at that record's header.  A candidate is only
+// accepted if the record parses *and* is followed by another plausible record,
+// which rejects most false positives in garbage.
+bool resyncDataBuf(BytesBuffer& br)
+{
+    size_t start = br.getPosition();
+    const uint8_t* data = br.getData();
+    size_t n = br.getSize();
+    if (n < 8)
+    {
+        return false; // too short to ever hold two plausible records
+    }
+
+    const size_t max_scan = 512;
+    size_t limit = std::min(start + max_scan, n - 7);
+    for (size_t off = start + 1; off < limit; off++)
+    {
+        size_t size = recordBodySize(data, n, off);
+        if (size == 0)
+        {
+            continue;
+        }
+        size_t end = off + 7 + size;
+        if (recordBodySize(data, n, end) != 0)
+        {
+            br.setPosition(off);
+            return true;
+        }
+    }
+    return false;
+}
+
 // Need at least `bytes` more bytes than the record header; bail cleanly if not.
 #define REC_NEED(bytes) \
     do { if (br.available() < (bytes)) { br.setPosition(rec_pos); return 0; } } while (0)
@@ -338,18 +437,19 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
         return 0;
     }
 
-    // The device's ts_offset grows over the session (it is relative to connect
-    // time), so base_time_sec is the host "now" at connect, fixed for the whole
-    // session. This is NOT refreshed per read: refreshing added the elapsed
-    // session time to every record, drifting all timestamps forward.
-    uint32_t timestamp = base_time_sec + (ts_offset * 10) / 1000;
-
-    // Firmware quirk: the device timestamps live RealTimeData (gid 0) records
-    // ~128s in the past relative to its current time, so gid 0 needs a +128s
-    // correction (this is what makes `radiacode mon` track the host clock).
-    // Every other record type is timestamped at its capture time and must NOT
-    // be shifted - applying the blanket +128 overcorrected raw/db/dc/rare by
-    // ~47-129s.
+    // Raw ts_offset is relative to CONNECT time, not host-now at read (see the
+    // hardware ts_offset experiment): it grows ~1s per session second, so the
+    // record base is the host wall-clock at connect (passed in as base_time_sec,
+    // fixed for the session).  record_time = base + ts_offset*10 ms.
+    //
+    // Firmware quirk: live RealTimeData (gid 0) records carry an extra ~128s
+    // lag relative to the other record types, so gid 0 needs a +128s correction
+    // to land on the true capture time (~now).  DB/raw/rare/dc/event records
+    // are timestamped at their capture time and must NOT be shifted - applying
+    // the blanket +128 overcorrected history by ~47-129s.
+    int64_t record_ms = (int64_t)base_time_sec * 1000 + (int64_t)ts_offset * 10;
+    uint32_t timestamp = (uint32_t)(record_ms / 1000);
+    uint16_t timestamp_ms = (uint16_t)(((record_ms % 1000) + 1000) % 1000);
     if (eid == 0 && gid == 0)
     {
         timestamp += 128;
@@ -364,6 +464,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             REC_NEED(15);
             RealTimeData* data = new RealTimeData();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             uint16_t cr_err, dr_err;
             if (!br.readFloat(&data->count_rate) || !br.readFloat(&data->dose_rate) ||
                 !br.readUint16(&cr_err) || !br.readUint16(&dr_err) ||
@@ -383,6 +484,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             REC_NEED(8);
             RawData* data = new RawData();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             if (!br.readFloat(&data->count_rate) || !br.readFloat(&data->dose_rate))
             {
                 delete data;
@@ -397,6 +499,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             REC_NEED(16);
             DoseRateDB* data = new DoseRateDB();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             uint16_t dr_err;
             if (!br.readUint32(&data->count) || !br.readFloat(&data->count_rate) ||
                 !br.readFloat(&data->dose_rate) || !br.readUint16(&dr_err) ||
@@ -415,6 +518,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             REC_NEED(14);
             RareData* data = new RareData();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             uint16_t temperature_raw, charge_raw;
             if (!br.readUint32(&data->duration) || !br.readFloat(&data->dose) ||
                 !br.readUint16(&temperature_raw) || !br.readUint16(&charge_raw) ||
@@ -434,6 +538,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             REC_NEED(6);
             DoseCounter* data = new DoseCounter();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             if (!br.readUint32(&data->dose_counter) || !br.readUint16(&data->flags))
             {
                 delete data;
@@ -463,6 +568,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             }
             Event* data = new Event();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             data->event = static_cast<EventId>(event_id);
             data->event_param1 = param1;
             data->flags = fl;
@@ -500,6 +606,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             REC_NEED(6);
             RawData* data = new RawData();
             data->timestamp = timestamp;
+            data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
             float rate; uint16_t fl;
             if (!br.readFloat(&rate) || !br.readUint16(&fl))
             {
@@ -560,6 +667,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             {
                 RawData* data = new RawData();
                 data->timestamp = timestamp;
+                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 if (!br.readFloat(&data->count_rate) || !br.readFloat(&data->dose_rate))
                 {
                     delete data;
@@ -572,6 +680,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             {
                 DoseRateDB* data = new DoseRateDB();
                 data->timestamp = timestamp;
+                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 uint16_t dr_err;
                 if (!br.readUint32(&data->count) || !br.readFloat(&data->count_rate) ||
                     !br.readFloat(&data->dose_rate) || !br.readUint16(&dr_err) ||
@@ -588,6 +697,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             {
                 RareData* data = new RareData();
                 data->timestamp = timestamp;
+                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 uint16_t temperature_raw, charge_raw;
                 if (!br.readUint32(&data->duration) || !br.readFloat(&data->dose) ||
                     !br.readUint16(&temperature_raw) || !br.readUint16(&charge_raw) ||
@@ -605,6 +715,7 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             {
                 DoseCounter* data = new DoseCounter();
                 data->timestamp = timestamp;
+                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 if (!br.readUint32(&data->dose_counter) || !br.readUint16(&data->flags))
                 {
                     delete data;
@@ -631,10 +742,26 @@ std::vector<DataItem*> decodeDataBuf(BytesBuffer& br, uint32_t base_time_sec)
     while (true)
     {
         size_t consumed = decodeDataBufRecord(br, base_time_sec, ret);
-        if (consumed == 0)
+        if (consumed > 0)
         {
-            break; // need more data or hit an unknown record type
+            continue;
         }
+
+        // consumed == 0: either the buffer does not yet hold a complete record
+        // header, or the record at the head was malformed / unknown.
+        if (br.available() < 7)
+        {
+            break; // need more data (or clean end of buffer)
+        }
+
+        // A full 7-byte header was present but decoding failed: assume the
+        // record is corrupt and re-sync to the next plausible record so a
+        // single glitch does not discard the rest of the buffer.
+        if (!resyncDataBuf(br))
+        {
+            break; // no further plausible record found
+        }
+        // resyncDataBuf repositioned the buffer at the next record; loop again.
     }
 
     return ret;

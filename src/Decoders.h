@@ -40,7 +40,19 @@
 size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<DataItem*>& out);
 
 // Decode a whole DATA_BUF buffer into a flat list of DataItems.
+//
+// Malformed / truncated records are skipped and decoding resumes at the next
+// plausible record boundary, so a single glitch does not discard the rest of
+// the buffer.  Returns only when the buffer needs more bytes or no further
+// plausible record is found.
 std::vector<DataItem*> decodeDataBuf(BytesBuffer& br, uint32_t base_time_sec);
+
+// After a malformed record, scan forward for the next plausible record header
+// and reposition the buffer there.  Returns true if a re-sync point was found,
+// leaving the buffer positioned at that record's header.  A candidate is only
+// accepted if the record parses *and* is followed by another plausible record,
+// which rejects most false positives in garbage.
+bool resyncDataBuf(BytesBuffer& br);
 
 // Decode spectrum data directly into an existing Spectrum object
 void decodeSpectrum(BytesBuffer& br, uint8_t format_version, Spectrum& spectrum);
