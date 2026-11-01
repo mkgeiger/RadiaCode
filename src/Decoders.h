@@ -27,7 +27,19 @@
 #include "BytesBuffer.h"
 #include <vector>
 
-// Decode data buffer from device
+// Decode a single DATA_BUF record from the front of the buffer.
+//
+// The decoded records are appended to `out` (the caller owns and must delete
+// the heap-allocated DataItems).  Multi-sample groups (eid==1) are expanded so
+// each sample becomes its own record, matching the python reference decoder.
+//
+// Returns the number of bytes consumed (0 if the buffer does not yet hold a
+// complete record, or the record type is not recognized).  When 0 is returned
+// the buffer position is left unchanged so the caller can wait for more bytes
+// or stop.
+size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<DataItem*>& out);
+
+// Decode a whole DATA_BUF buffer into a flat list of DataItems.
 std::vector<DataItem*> decodeDataBuf(BytesBuffer& br, uint32_t base_time_sec);
 
 // Decode spectrum data directly into an existing Spectrum object

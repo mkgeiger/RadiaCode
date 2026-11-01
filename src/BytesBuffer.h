@@ -23,13 +23,15 @@
 #ifndef BytesBuffer_h
 #define BytesBuffer_h
 
-#include "Arduino.h"
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
 class BytesBuffer
 {
     public:
-        // Define a larger buffer size to match the BLE transport
-        static const size_t MAX_BUFFER_SIZE = 4096; // Increased to 4KB
+        // Define a buffer size large enough for a full raw spectrum read
+        static const size_t MAX_BUFFER_SIZE = 8192;
         
         BytesBuffer(void);
         BytesBuffer(const uint8_t* data, size_t length);
@@ -47,7 +49,7 @@ class BytesBuffer
         bool readFloat(float* value);
         size_t readBytes(uint8_t* buffer, size_t length);
         bool peekBytes(uint8_t* buffer, size_t offset, size_t length);
-        String readString(void);
+        std::string readString(void);
 
         // Writing methods
         bool writeUint8(uint8_t value);
@@ -58,7 +60,7 @@ class BytesBuffer
         bool writeInt32(int32_t value);
         bool writeFloat(float value);
         size_t writeBytes(const uint8_t* buffer, size_t length);
-        bool writeString(const String& str);
+        bool writeString(const std::string& str);
 
         // Utility methods
         size_t available(void) const;

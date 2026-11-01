@@ -24,12 +24,30 @@
 #define RadiaCodeTransport_h
 
 #include "BytesBuffer.h"
+#include "RadiaCodeTypes.h"
+#include <vector>
 
 class RadiaCodeTransport
 {
     public:
         virtual ~RadiaCodeTransport(void) {}
         virtual BytesBuffer execute(const uint8_t* request, size_t length) = 0;
+
+        // Whether the transport's underlying connection is alive. An empty
+        // DATA_BUF read is normal ("caught up"), so connection loss must be
+        // detected from the transport, not from the absence of records.
+        virtual bool isConnected(void) const { return false; }
+
+        // Streaming DATA_BUF support. Base implementations are no-ops; only
+        // transports that can decode records incrementally override these.
+        virtual void setDataBufStream(uint32_t base_time_sec)
+        {
+            (void)base_time_sec;
+        }
+        virtual std::vector<DataItem*> drainDataBufRecords(void)
+        {
+            return std::vector<DataItem*>();
+        }
 };
 
 #endif

@@ -27,7 +27,7 @@
 #ifndef RadiaCode_h
 #define RadiaCode_h
 
-#include "Arduino.h"
+#include <string>
 #include "BytesBuffer.h"
 #include "RadiaCodeTypes.h"
 #include "RadiaCodeTransport.h"
@@ -52,13 +52,13 @@ class RadiaCode
 
         // Device information methods
         uint32_t deviceStatus(void);
-        String fwSignature(void);
-        std::tuple<int, int, String, int, int, String> fwVersion(void);
-        String hwSerialNumber(void);
-        String serialNumber(void);
-        String configuration(void);
-        String textMessage(void);
-        String commands(void);
+        std::string fwSignature(void);
+        std::tuple<int, int, std::string, int, int, std::string> fwVersion(void);
+        std::string hwSerialNumber(void);
+        std::string serialNumber(void);
+        std::string configuration(void);
+        std::string textMessage(void);
+        std::string commands(void);
 
         // Time and configuration methods
         void setLocalTime(uint8_t day, uint8_t month, uint16_t year, uint8_t second, uint8_t minute, uint8_t hour);
@@ -68,6 +68,9 @@ class RadiaCode
         std::vector<DataItem*> dataBuf(void);
         Spectrum spectrum(void);
         Spectrum spectrumAccum(void);
+
+        // Connection status
+        bool isConnected(void) const;
 
         // Reset methods
         void doseReset(void);

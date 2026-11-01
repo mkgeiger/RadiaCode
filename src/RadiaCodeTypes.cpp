@@ -21,6 +21,9 @@
 /**********************************************************************************/
 
 #include "RadiaCodeTypes.h"
+#include "RadiaCodeLog.h"
+
+#include <cstring>
 
 // Debugging switches
 #define RCTYPES_DEBUG_WARNING
@@ -62,7 +65,7 @@ Spectrum::Spectrum(const Spectrum& other) :
     if (safe_count > MAX_CHANNELS)
     {
 #ifdef RCTYPES_DEBUG_WARNING
-        Serial.println("Warning: Copy constructor truncating spectrum data");
+        RC_LOGW("Warning: Copy constructor truncating spectrum data");
 #endif
         safe_count = MAX_CHANNELS;
     }
@@ -95,7 +98,7 @@ Spectrum& Spectrum::operator=(const Spectrum& other)
         if (safe_count > MAX_CHANNELS)
         {
 #ifdef RCTYPES_DEBUG_WARNING
-            Serial.println("Warning: Assignment operator truncating spectrum data");
+            RC_LOGW("Warning: Assignment operator truncating spectrum data");
 #endif
             safe_count = MAX_CHANNELS;
         }
@@ -148,12 +151,12 @@ void Spectrum::push_back(uint32_t value)
     }
     else
     {
-        // Only print the warning once to avoid flooding Serial
+        // Only print the warning once to avoid flooding the log
         static bool warning_printed = false;
         if (!warning_printed)
         {
 #ifdef RCTYPES_DEBUG_WARNING
-            Serial.println("Warning: Spectrum array full, ignoring additional data");
+            RC_LOGW("Warning: Spectrum array full, ignoring additional data");
 #endif
             warning_printed = true;
         }

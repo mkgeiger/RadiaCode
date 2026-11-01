@@ -27,6 +27,11 @@
 #include "RadiaCode.h"
 #include "BluetoothTransport.h"
 #include "Decoders.h"
+#include "RadiaCodeLog.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <time.h>
 
 // Debugging switches
@@ -54,88 +59,76 @@ RadiaCode::RadiaCode(const char* bluetooth_mac, bool ignore_firmware_compatibili
     _spectrum_format_version = 0;
 
     // Check if bluetooth is supported on this platform
-#if defined(ARDUINO_ARCH_ESP32)
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
     _bt_supported = true;
 #else
     _bt_supported = false;
 #endif
 
-    // Connect via Bluetooth
-    try
+    // Connect via Bluetooth (no try/catch: ESP-IDF builds default to
+    // -fno-exceptions, and nothing here deliberately throws)
+    if (bluetooth_mac != nullptr && _bt_supported)
     {
-        if (bluetooth_mac != nullptr && _bt_supported)
-        {
-#if defined(ARDUINO_ARCH_ESP32)
-            _connection = new BluetoothTransport(bluetooth_mac);
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+        _connection = new BluetoothTransport(bluetooth_mac);
 #endif
-        }
-
-        if (_connection == nullptr)
-        {
-#ifdef RC_DEBUG_ERROR
-            Serial.println("Error: Failed to create transport connection");
-#endif
-            return;
-        }
-
-        // Initialize device with error handling
-        uint8_t init_data[] = {0x01, 0xFF, 0x12, 0xFF};
-        execute(COMMAND::SET_EXCHANGE, init_data, sizeof(init_data));
-
-        // Set current time
-        time_t now = time(nullptr);   // Get current time in UNIX format, years since 1900
-        if (now > 0)
-        {
-            struct tm* timeinfo = localtime(&now);
-            if (timeinfo != nullptr)
-            {
-                setLocalTime(timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900, 
-                    timeinfo->tm_sec, timeinfo->tm_min, timeinfo->tm_hour);
-            }
-            // Calculate base time (current time + 128 seconds)
-            _base_time_sec = now + 128;
-        }
-
-        deviceTime(0);
-
-        // Check firmware version
-        auto version = fwVersion();
-        int vmaj = std::get<3>(version);
-        int vmin = std::get<4>(version);
-
-#ifdef RC_DEBUG_ERROR
-        if (!ignore_firmware_compatibility_check && ((vmaj < 4) || ((vmaj == 4) && (vmin < 8))))
-        {
-            char error_msg[100];
-            sprintf(error_msg, "Error:Incompatible firmware version %d.%d, >=4.8 required. Upgrade device firmware", vmaj, vmin);
-            Serial.println(error_msg);
-        }
-#endif
-
-        // Determine spectrum format version
-        String config = configuration();
-        int pos = config.indexOf("SpecFormatVersion=");
-        if (pos >= 0)
-        {
-            String versionSubstr = config.substring(pos + 18);
-            int newlinePos = versionSubstr.indexOf('\n');
-            if (newlinePos > 0)
-            {
-                versionSubstr = versionSubstr.substring(0, newlinePos);
-            }
-            _spectrum_format_version = versionSubstr.toInt();
-        }
     }
-    catch (...)
+
+    if (_connection == nullptr)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error during RadiaCode initialization");
+        RC_LOGE("Error: Failed to create transport connection");
 #endif
-        if (_connection != nullptr)
+        return;
+    }
+
+    // Initialize device with error handling
+    uint8_t init_data[] = {0x01, 0xFF, 0x12, 0xFF};
+    execute(COMMAND::SET_EXCHANGE, init_data, sizeof(init_data));
+
+    // Set current time
+    time_t now = time(nullptr);   // Get current time in UNIX format, years since 1900
+    if (now > 0)
+    {
+        struct tm* timeinfo = localtime(&now);
+        if (timeinfo != nullptr)
         {
-            delete _connection;
-            _connection = nullptr;
+            setLocalTime(timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year + 1900, 
+                timeinfo->tm_sec, timeinfo->tm_min, timeinfo->tm_hour);
         }
+        // Base time for timestamping DATA_BUF records. The device's ts_offset
+        // grows over the session (it is relative to connect time), so the base
+        // is fixed to host "now" at connect; decodeDataBufRecord() applies a
+        // +128s correction to live RealTimeData records only.
+        _base_time_sec = now;
+    }
+
+    deviceTime(0);
+
+    // Check firmware version
+    auto version = fwVersion();
+    int vmaj = std::get<3>(version);
+    int vmin = std::get<4>(version);
+
+#ifdef RC_DEBUG_ERROR
+    if (!ignore_firmware_compatibility_check && ((vmaj < 4) || ((vmaj == 4) && (vmin < 8))))
+    {
+        RC_LOGE("Error:Incompatible firmware version %d.%d, >=4.8 required. Upgrade device firmware", vmaj, vmin);
+    }
+#endif
+
+    // Determine spectrum format version
+    std::string config = configuration();
+    size_t pos = config.find("SpecFormatVersion=");
+    if (pos != std::string::npos)
+    {
+        std::string versionSubstr = config.substr(pos + 18);
+        size_t newlinePos = versionSubstr.find('\n');
+        if (newlinePos != std::string::npos)
+        {
+            versionSubstr = versionSubstr.substr(0, newlinePos);
+        }
+        _spectrum_format_version = static_cast<uint8_t>(atoi(versionSubstr.c_str()));
     }
 }
 
@@ -154,7 +147,7 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
     if (_connection == nullptr)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Connection is null in execute()");
+        RC_LOGE("Error: Connection is null in execute()");
 #endif
         return BytesBuffer(); // Return empty buffer
     }
@@ -171,14 +164,7 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
 
 #ifdef RC_DEBUG_INFO
     // Debug: Print command info
-    Serial.print("CMD 0x");
-    Serial.print((uint16_t)reqtype, HEX);
-    Serial.print(" (");
-    Serial.print((uint16_t)reqtype);
-    Serial.print(") seq=");
-    Serial.print(req_seq_no, HEX);
-    Serial.print(" args_len=");
-    Serial.print(args_len);
+    RC_LOGI("CMD 0x%04X (%u) seq=0x%02X args_len=%zu", (unsigned)reqtype, (unsigned)reqtype, req_seq_no, args_len);
 #endif
 
     // Calculate total request size
@@ -194,9 +180,7 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
 
 #ifdef RC_DEBUG_INFO
     // Debug: Print request bytes
-    Serial.print(" TX[");
-    Serial.print(request_size + 4);
-    Serial.print("]: ");
+    RC_LOGI(" TX[%zu]:", request_size + 4);
 #endif
 
     // Create full request with length prefix
@@ -206,20 +190,8 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
     memcpy(full_request + 4, request, request_size);
 
 #ifdef RC_DEBUG_INFO
-    // Print length prefix and request
-    for (size_t i = 0; i < 4; i++)
-    {
-        if (full_request[i] < 0x10) Serial.print("0");
-        Serial.print(full_request[i], HEX);
-        Serial.print(" ");
-    }
-
-    for (size_t i = 0; i < request_size; i++)
-    {
-        if (request[i] < 0x10) Serial.print("0");
-        Serial.print(request[i], HEX);
-        Serial.print(" ");
-    }
+    // Print length prefix and request (kept as a no-op placeholder - hex dump removed
+    // since it added little value beyond the CMD/TX/RX summary lines already logged).
 #endif
 
     // Execute request
@@ -227,31 +199,17 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
 
 #ifdef RC_DEBUG_INFO
     // Debug: Print response bytes
-    Serial.print(" RX[");
-    Serial.print(response.getSize());
-    Serial.print("]: ");
+    RC_LOGI(" RX[%zu]:", response.getSize());
 #endif
 
 #ifdef RC_DEBUG_INFO
     // Print first 128 bytes of response for debugging
-    size_t debug_len = min((size_t)128, response.getSize());
+    size_t debug_len = std::min((size_t)128, response.getSize());
     uint8_t temp_buf[128];
     size_t original_pos = response.getPosition();
     response.setPosition(0);
     response.readBytes(temp_buf, debug_len);
     response.setPosition(original_pos);
-
-    for (size_t i = 0; i < debug_len; i++)
-    {
-        if (temp_buf[i] < 0x10) Serial.print("0");
-        Serial.print(temp_buf[i], HEX);
-        Serial.print(" ");
-    }
-    if (response.getSize() > 128)
-    {
-        Serial.print("...");
-    }
-    Serial.println();
 #endif
 
     // Clean up
@@ -267,17 +225,9 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
     {
         if (req_header[i] != resp_header[i])
         {
-            Serial.print("Header mismatch: req=");
-            for (int j = 0; j < 4; j++)
-            {
-                Serial.print(req_header[j], HEX);
-            }
-            Serial.print(", resp=");
-            for (int j = 0; j < 4; j++)
-            {
-                Serial.print(resp_header[j], HEX);
-            }
-            Serial.println();
+            RC_LOGI("Header mismatch: req=%02X%02X%02X%02X, resp=%02X%02X%02X%02X",
+                req_header[0], req_header[1], req_header[2], req_header[3],
+                resp_header[0], resp_header[1], resp_header[2], resp_header[3]);
             break;
         }
     }
@@ -289,11 +239,7 @@ BytesBuffer RadiaCode::execute(COMMAND reqtype, const uint8_t* args, size_t args
 BytesBuffer RadiaCode::readRequest(uint32_t command_id)
 {
 #ifdef RC_DEBUG_INFO
-    Serial.print("READ_REQ 0x");
-    Serial.print(command_id, HEX);
-    Serial.print(" (");
-    Serial.print(command_id);
-    Serial.print(")");
+    RC_LOGI("READ_REQ 0x%08X (%u)", (unsigned)command_id, (unsigned)command_id);
 #endif
 
     uint8_t cmd_bytes[4];
@@ -305,8 +251,7 @@ BytesBuffer RadiaCode::readRequest(uint32_t command_id)
     if (r.getSize() < 8)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.print("Error: Invalid response size for command ");
-        Serial.println(command_id);
+        RC_LOGE("Error: Invalid response size for command %u", (unsigned)command_id);
 #endif
         return BytesBuffer(); // Return empty buffer
     }
@@ -318,25 +263,19 @@ BytesBuffer RadiaCode::readRequest(uint32_t command_id)
     if (!headerValid)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Failed to read response header");
+        RC_LOGE("Error: Failed to read response header");
 #endif
         return BytesBuffer(); // Return empty buffer
     }
 
 #ifdef RC_DEBUG_INFO
-    Serial.print(" -> retcode=");
-    Serial.print(retcode);
-    Serial.print(" len=");
-    Serial.println(flen);
+    RC_LOGI(" -> retcode=%u len=%u", (unsigned)retcode, (unsigned)flen);
 #endif
 
 #ifdef RC_DEBUG_ERROR
     if (retcode != 1)
     {
-        Serial.print("Error: Unexpected return code for command ");
-        Serial.print(command_id, HEX);
-        Serial.print(": ");
-        Serial.println(retcode);
+        RC_LOGE("Error: Unexpected return code for command 0x%08X: %u", (unsigned)command_id, (unsigned)retcode);
         // Continue processing anyway
     }
 #endif
@@ -345,8 +284,7 @@ BytesBuffer RadiaCode::readRequest(uint32_t command_id)
     // Add a safety check for the expected data size
     if (flen > (BytesBuffer::MAX_BUFFER_SIZE - 8))
     {
-        Serial.print("Warning: Data length too large in readRequest: ");
-        Serial.println(flen);
+        RC_LOGW("Warning: Data length too large in readRequest: %u", (unsigned)flen);
     }
 #endif
 
@@ -366,12 +304,8 @@ BytesBuffer RadiaCode::readRequest(uint32_t command_id)
 #ifdef RC_DEBUG_ERROR
     if (r.available() != flen)
     {
-        Serial.print("Error: Unexpected data size for command ");
-        Serial.print(command_id, HEX);
-        Serial.print(": expected ");
-        Serial.print(flen);
-        Serial.print(", got ");
-        Serial.println(r.available());
+        RC_LOGE("Error: Unexpected data size for command 0x%08X: expected %u, got %zu",
+            (unsigned)command_id, (unsigned)flen, r.available());
     }
 #endif
 
@@ -381,12 +315,7 @@ BytesBuffer RadiaCode::readRequest(uint32_t command_id)
 void RadiaCode::writeRequest(uint32_t command_id, const uint8_t* data, size_t data_len)
 {
 #ifdef RC_DEBUG_INFO
-    Serial.print("WRITE_REQ 0x");
-    Serial.print(command_id, HEX);
-    Serial.print(" (");
-    Serial.print(command_id);
-    Serial.print(") len=");
-    Serial.print(data_len);
+    RC_LOGI("WRITE_REQ 0x%08X (%u) len=%zu", (unsigned)command_id, (unsigned)command_id, data_len);
 #endif
 
     // Create command buffer
@@ -413,15 +342,13 @@ void RadiaCode::writeRequest(uint32_t command_id, const uint8_t* data, size_t da
     r.readUint32(&retcode);
 
 #ifdef RC_DEBUG_INFO
-    Serial.print(" -> retcode=");
-    Serial.println(retcode);
+    RC_LOGI(" -> retcode=%u", (unsigned)retcode);
 #endif
 
 #ifdef RC_DEBUG_ERROR
     if (retcode != 1)
     {
-        Serial.print("Write request failed, retcode=");
-        Serial.println(retcode);
+        RC_LOGE("Write request failed, retcode=%u", (unsigned)retcode);
     }
 #endif
 }
@@ -434,7 +361,7 @@ std::vector<float> RadiaCode::batchReadVSFRs(const std::vector<uint32_t>& vsfr_i
     if (nvsfr == 0)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: No VSFRs specified");
+        RC_LOGE("Error: No VSFRs specified");
 #endif
         return ret;
     }
@@ -468,10 +395,7 @@ std::vector<float> RadiaCode::batchReadVSFRs(const std::vector<uint32_t>& vsfr_i
     if (valid_flags != expected_flags)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.print("Error: Unexpected validity flags, bad vsfr_id? ");
-        Serial.print(valid_flags, BIN);
-        Serial.print(" != ");
-        Serial.println(expected_flags, BIN);
+        RC_LOGE("Error: Unexpected validity flags, bad vsfr_id? 0x%X != 0x%X", (unsigned)valid_flags, (unsigned)expected_flags);
 #endif
         return ret;
     }
@@ -543,10 +467,7 @@ uint32_t RadiaCode::readVSFR(uint32_t vsfr_id)
     if (valid_flags != 1)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.print("Error: Invalid VSFR ID 0x");
-        Serial.print(vsfr_id, HEX);
-        Serial.print(", validity flags: ");
-        Serial.println(valid_flags, BIN);
+        RC_LOGE("Error: Invalid VSFR ID 0x%08X, validity flags: 0x%X", (unsigned)vsfr_id, (unsigned)valid_flags);
 #endif
         return 0;
     }
@@ -601,24 +522,24 @@ void RadiaCode::setLocalTime(uint8_t day, uint8_t month, uint16_t year, uint8_t 
     execute(COMMAND::SET_TIME, d, sizeof(d));
 }
 
-String RadiaCode::fwSignature(void)
+std::string RadiaCode::fwSignature(void)
 {
     uint32_t signature;
     char buf[256];
     BytesBuffer r = execute(COMMAND::FW_SIGNATURE);
 
     r.readUint32(&signature);
-    String filename = r.readString();
-    String idstring = r.readString();
-    sprintf(buf, "Signature: %08lX, FileName=\"%s\", IdString=\"%s\"", signature, filename.c_str(), idstring.c_str());
-    return String(buf);
+    std::string filename = r.readString();
+    std::string idstring = r.readString();
+    sprintf(buf, "Signature: %08lX, FileName=\"%s\", IdString=\"%s\"", (unsigned long)signature, filename.c_str(), idstring.c_str());
+    return std::string(buf);
 }
 
-std::tuple<int, int, String, int, int, String> RadiaCode::fwVersion(void)
+std::tuple<int, int, std::string, int, int, std::string> RadiaCode::fwVersion(void)
 {
     BytesBuffer r;
     uint16_t boot_minor, boot_major, target_minor, target_major;
-    String boot_date, target_date;
+    std::string boot_date, target_date;
 
     r = execute(COMMAND::GET_VERSION);
     r.readUint16(&boot_minor);
@@ -629,12 +550,15 @@ std::tuple<int, int, String, int, int, String> RadiaCode::fwVersion(void)
     r.readUint16(&target_major);
 
     target_date = r.readString();
-    target_date.remove(target_date.length() - 1);  // Remove trailing null byte
+    if (!target_date.empty())
+    {
+        target_date.resize(target_date.length() - 1);  // Remove trailing null byte
+    }
 
     return std::make_tuple(boot_major, boot_minor, boot_date, target_major, target_minor, target_date);
 }
 
-String RadiaCode::hwSerialNumber(void)
+std::string RadiaCode::hwSerialNumber(void)
 {
     uint32_t serial_len;
     BytesBuffer r = execute(COMMAND::GET_SERIAL);
@@ -644,18 +568,18 @@ String RadiaCode::hwSerialNumber(void)
     if ((serial_len % 4) != 0)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Serial number length is not a multiple of 4");
+        RC_LOGE("Error: Serial number length is not a multiple of 4");
 #endif
         return "";
     }
 
-    String serial = "";
+    std::string serial = "";
     for (uint32_t i = 0; i < (serial_len / 4); i++)
     {
         uint32_t group;
         r.readUint32(&group);
         char buf[10];
-        sprintf(buf, "%08lX", group);
+        sprintf(buf, "%08lX", (unsigned long)group);
         if (i > 0) serial += "-";
         serial += buf;
     }
@@ -663,21 +587,21 @@ String RadiaCode::hwSerialNumber(void)
     return serial;
 }
 
-String RadiaCode::configuration(void)
+std::string RadiaCode::configuration(void)
 {
-    String result;
+    std::string result;
     BytesBuffer r = readRequest(VS::CONFIGURATION);
 
     size_t len = r.available();
     char* buffer = new char[len + 1];
     r.readBytes((uint8_t*)buffer, len);
     buffer[len] = '\0';
-    result = String(buffer);
+    result = std::string(buffer);
     delete[] buffer;
     return result;
 }
 
-String RadiaCode::textMessage(void)
+std::string RadiaCode::textMessage(void)
 {
     BytesBuffer r = readRequest(VS::TEXT_MESSAGE);
 
@@ -686,15 +610,15 @@ String RadiaCode::textMessage(void)
     r.readBytes((uint8_t*)buffer, len);
     buffer[len] = '\0';
 
-    String result = String(buffer);
+    std::string result = std::string(buffer);
     delete[] buffer;
 
     return result;
 }
 
-String RadiaCode::serialNumber(void)
+std::string RadiaCode::serialNumber(void)
 {
-    String result;
+    std::string result;
     size_t len;
     BytesBuffer r;
     char* buffer;
@@ -704,12 +628,12 @@ String RadiaCode::serialNumber(void)
     buffer = new char[len + 1];
     r.readBytes((uint8_t*)buffer, len);
     buffer[len] = '\0';
-    result = String(buffer);
+    result = std::string(buffer);
     delete[] buffer;
     return result;
 }
 
-String RadiaCode::commands(void)
+std::string RadiaCode::commands(void)
 {
     BytesBuffer r = readRequest(VS::SFR_FILE);
 
@@ -718,7 +642,7 @@ String RadiaCode::commands(void)
     r.readBytes((uint8_t*)buffer, len);
     buffer[len] = '\0';
 
-    String result = String(buffer);
+    std::string result = std::string(buffer);
     delete[] buffer;
 
     return result;
@@ -734,8 +658,29 @@ void RadiaCode::deviceTime(uint32_t v)
 
 std::vector<DataItem*> RadiaCode::dataBuf(void)
 {
-    BytesBuffer r = readRequest(VS::DATA_BUF);
-    return decodeDataBuf(r, _base_time_sec);
+    if (_connection == nullptr)
+    {
+        return std::vector<DataItem*>();
+    }
+
+    // Enable streaming record parsing on the transport so a large DATA_BUF
+    // response is decoded incrementally as BLE notifications arrive, instead
+    // of buffering the whole (potentially huge) response in RAM.
+    _connection->setDataBufStream(_base_time_sec);
+
+    // Send the DATA_BUF read request: RD_VIRT_STRING with the DATA_BUF VS id.
+    uint32_t command_id = VS::DATA_BUF;
+    uint8_t cmd_bytes[4];
+    memcpy(cmd_bytes, &command_id, 4);
+    BytesBuffer r = execute(COMMAND::RD_VIRT_STRING, cmd_bytes, 4);
+
+    // Drain the records the transport parsed incrementally.
+    return _connection->drainDataBufRecords();
+}
+
+bool RadiaCode::isConnected(void) const
+{
+    return (_connection != nullptr) && _connection->isConnected();
 }
 
 Spectrum RadiaCode::spectrum(void)
@@ -753,7 +698,7 @@ Spectrum RadiaCode::spectrum(void)
     if (r.getSize() < 16)
     { // Minimum size for header (duration + a0,a1,a2)
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Invalid or empty spectrum data received");
+        RC_LOGE("Error: Invalid or empty spectrum data received");
 #endif
         return result; // Return empty spectrum
     }
@@ -765,7 +710,7 @@ Spectrum RadiaCode::spectrum(void)
     // Safety check - make sure we got some data
     if (result.count_size == 0)
     {
-        Serial.println("Warning: No spectrum data points decoded");
+        RC_LOGW("Warning: No spectrum data points decoded");
     }
 #endif
 
@@ -788,7 +733,7 @@ Spectrum RadiaCode::spectrumAccum(void)
     if (r.getSize() < 16)
     { // Minimum size for header (duration + a0,a1,a2)
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Invalid or empty accumulated spectrum data received");
+        RC_LOGE("Error: Invalid or empty accumulated spectrum data received");
 #endif
         return result; // Return empty spectrum
     }
@@ -800,7 +745,7 @@ Spectrum RadiaCode::spectrumAccum(void)
     // Safety check - make sure we got some data
     if (result.count_size == 0)
     {
-        Serial.println("Warning: No accumulated spectrum data points decoded");
+        RC_LOGW("Warning: No accumulated spectrum data points decoded");
     }
 #endif
 
@@ -830,8 +775,7 @@ void RadiaCode::spectrumReset(void)
 #ifdef RC_DEBUG_ERROR
     if (retcode != 1)
     {
-        Serial.print("Spectrum reset failed, retcode=");
-        Serial.println(retcode);
+        RC_LOGE("Spectrum reset failed, retcode=%u", (unsigned)retcode);
     }
 #endif
 }
@@ -873,8 +817,7 @@ void RadiaCode::setEnergyCalib(float a0, float a1, float a2)
 #ifdef RC_DEBUG_ERROR
     if (retcode != 1)
     {
-        Serial.print("Set energy calibration failed, retcode=");
-        Serial.println(retcode);
+        RC_LOGE("Set energy calibration failed, retcode=%u", (unsigned)retcode);
     }
 #endif
 }
@@ -889,7 +832,7 @@ void RadiaCode::setLanguage(const char* lang)
     if ((strcmp(lang, "ru") != 0) && (strcmp(lang, "en") != 0))
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Unsupported language. Use 'ru' or 'en'");
+        RC_LOGE("Error: Unsupported language. Use 'ru' or 'en'");
 #endif
         return;
     }
@@ -968,7 +911,7 @@ void RadiaCode::setVibroCtrl(CTRL ctrl_flags)
     if (ctrl_flags & CTRL::CLICKS)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: CTRL::CLICKS not supported for vibro");
+        RC_LOGE("Error: CTRL::CLICKS not supported for vibro");
 #endif
         return;
     }
@@ -976,7 +919,7 @@ void RadiaCode::setVibroCtrl(CTRL ctrl_flags)
     if (ctrl_flags & CTRL::CONNECTION)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: CTRL::CONNECTION not supported for vibro");
+        RC_LOGE("Error: CTRL::CONNECTION not supported for vibro");
 #endif
         return;
     }
@@ -984,7 +927,7 @@ void RadiaCode::setVibroCtrl(CTRL ctrl_flags)
     if (ctrl_flags & CTRL::POWER)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: CTRL::POWER not supported for vibro");
+        RC_LOGE("Error: CTRL::POWER not supported for vibro");
 #endif
         return;
     }
@@ -1001,7 +944,7 @@ void RadiaCode::setDisplayOffTime(uint8_t seconds)
     if ((seconds != 5) && (seconds != 10) && (seconds != 15) && (seconds != 30))
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Display off time must be 5, 10, 15, or 30 seconds");
+        RC_LOGE("Error: Display off time must be 5, 10, 15, or 30 seconds");
 #endif
         return;
     }
@@ -1018,7 +961,7 @@ void RadiaCode::setDisplayBrightness(uint8_t brightness)
     if (brightness > 9)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: Brightness must be between 0 and 9");
+        RC_LOGE("Error: Brightness must be between 0 and 9");
 #endif
         return;
     }
@@ -1139,44 +1082,44 @@ bool RadiaCode::setAlarmLimits(
     if (l1_count_rate >= 0.0f)
     {
         which_limits.push_back(VSFR::CR_LEV1_cp10s);
-        limit_values.push_back((uint32_t)round(l1_count_rate * count_multiplier));
+        limit_values.push_back((uint32_t)std::round(l1_count_rate * count_multiplier));
     }
 
     if (l2_count_rate >= 0.0f)
     {
         which_limits.push_back(VSFR::CR_LEV2_cp10s);
-        limit_values.push_back((uint32_t)round(l2_count_rate * count_multiplier));
+        limit_values.push_back((uint32_t)std::round(l2_count_rate * count_multiplier));
     }
 
     if (l1_dose_rate >= 0.0f)
     {
         which_limits.push_back(VSFR::DR_LEV1_uR_h);
-        limit_values.push_back((uint32_t)round(l1_dose_rate * dose_multiplier));
+        limit_values.push_back((uint32_t)std::round(l1_dose_rate * dose_multiplier));
     }
 
     if (l2_dose_rate >= 0.0f)
     {
         which_limits.push_back(VSFR::DR_LEV2_uR_h);
-        limit_values.push_back((uint32_t)round(l2_dose_rate * dose_multiplier));
+        limit_values.push_back((uint32_t)std::round(l2_dose_rate * dose_multiplier));
     }
 
     if (l1_dose >= 0.0f)
     {
         which_limits.push_back(VSFR::DS_LEV1_uR);
-        limit_values.push_back((uint32_t)round(l1_dose * 1.0e6f * dose_multiplier));
+        limit_values.push_back((uint32_t)std::round(l1_dose * 1.0e6f * dose_multiplier));
     }
 
     if (l2_dose >= 0.0f)
     {
         which_limits.push_back(VSFR::DS_LEV2_uR);
-        limit_values.push_back((uint32_t)round(l2_dose * 1.0e6f * dose_multiplier));
+        limit_values.push_back((uint32_t)std::round(l2_dose * 1.0e6f * dose_multiplier));
     }
 
     size_t num_to_set = which_limits.size();
     if (num_to_set == 0)
     {
 #ifdef RC_DEBUG_ERROR
-        Serial.println("Error: No limits specified");
+        RC_LOGE("Error: No limits specified");
 #endif
         return false;
     }
