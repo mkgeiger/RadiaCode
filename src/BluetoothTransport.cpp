@@ -188,8 +188,14 @@ BluetoothTransport::~BluetoothTransport(void)
 #elif defined(ESP_PLATFORM)
     if (_peripheral != nullptr)
     {
+        // deleteClient() disconnects (if needed) and frees the NimBLE client
+        // slot so createClient() can reuse it on the next connect. Without
+        // this, every reconnect leaks a client, and with a low
+        // MAX_CONNECTIONS the allocator eventually returns nullptr and we
+        // deref it in connect().
         NimBLEClient* pClient = (NimBLEClient*)_peripheral;
-        pClient->disconnect();
+        NimBLEDevice::deleteClient(pClient);
+        _peripheral = nullptr;
     }
 #endif
 
