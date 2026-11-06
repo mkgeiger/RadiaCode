@@ -33,6 +33,9 @@
 #include <cstdio>
 #include <cstring>
 #include <time.h>
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+#include <esp_timer.h>
+#endif
 
 // Debugging switches
 #undef  RC_DEBUG_INFO
@@ -56,6 +59,7 @@ RadiaCode::RadiaCode(const char* bluetooth_mac, bool ignore_firmware_compatibili
     _seq = 0;
     _connection = nullptr;
     _base_time_sec = 0;
+    _base_mono_us = 0;
     _spectrum_format_version = 0;
 
     // Check if bluetooth is supported on this platform
@@ -88,6 +92,12 @@ RadiaCode::RadiaCode(const char* bluetooth_mac, bool ignore_firmware_compatibili
 
     // Set current time
     time_t now = time(nullptr);   // Get current time in UNIX format, years since 1900
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+    // Monotonic anchor for the connect instant, taken whether or not the wall
+    // clock is already set; resyncBaseTime() uses it to re-anchor the base
+    // after a late clock set or a mid-session clock step.
+    _base_mono_us = esp_timer_get_time();
+#endif
     if (now > 0)
     {
         struct tm* timeinfo = localtime(&now);
@@ -98,8 +108,10 @@ RadiaCode::RadiaCode(const char* bluetooth_mac, bool ignore_firmware_compatibili
         }
         // Base time for timestamping DATA_BUF records. The device's ts_offset
         // is relative to connect time (it grows ~1s per session second), so the
-        // base is fixed to host "now" at connect and never refreshed; the
-        // decoder applies a +128s correction to live RealTimeData (gid 0).
+        // base is fixed to host "now" at connect and not refreshed per read
+        // (that drifts records forward); resyncBaseTime() only re-anchors it
+        // when the host wall clock actually steps. The decoder applies the
+        // +128s correction to live RealTimeData (gid 0).
         _base_time_sec = now;
     }
 
@@ -692,6 +704,28 @@ void RadiaCode::deviceTime(uint32_t v)
     writeRequest(VSFR::DEVICE_TIME, data, 4);
 }
 
+void RadiaCode::resyncBaseTime(void)
+{
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+    time_t now = time(nullptr);
+    if (now <= 0)
+        return;  // wall clock still unset; nothing to anchor to yet
+
+    // The device's ts_offset is relative to the connect instant, so the correct
+    // base is the wall-clock time that corresponded to connect. Reconstruct it
+    // from the monotonic elapsed time since connect: if the wall clock was
+    // stepped (late GPS/RTC sync) after connect, this differs from the current
+    // base by exactly the step amount. Using monotonic elapsed (not now-at-read)
+    // is what avoids the per-read refresh drift: with a stable clock this is a
+    // no-op. Only re-anchor on a real step, not on adjtime slew or RTC jitter.
+    int64_t elapsed_sec = (esp_timer_get_time() - _base_mono_us) / 1000000;
+    int64_t expected = (int64_t)now - elapsed_sec;
+    int64_t drift = expected - (int64_t)_base_time_sec;
+    if (_base_time_sec == 0 || drift > 2 || drift < -2)
+        _base_time_sec = (uint32_t)expected;
+#endif
+}
+
 std::vector<DataItem*> RadiaCode::dataBuf(void)
 {
     if (_connection == nullptr)
@@ -702,11 +736,11 @@ std::vector<DataItem*> RadiaCode::dataBuf(void)
     // The device timestamps DATA_BUF records relative to CONNECT time: raw
     // ts_offset grows ~1s per second of session time (measured on hardware:
     // ts_offset = elapsed_since_connect - 128 for live records). So the record
-    // base must be the host wall-clock at connect, FIXED for the whole session.
-    // Refreshing it per read adds elapsed time to every record, drifting
-    // timestamps into the future (see the ts_offset experiment).
-    //
-    // _base_time_sec is set to host "now" at connect in the constructor.
+    // base must be the host wall-clock at connect. Refreshing it per read adds
+    // elapsed time to every record, drifting timestamps into the future (see
+    // the ts_offset experiment). _base_time_sec is set to host "now" at connect
+    // and only re-anchored here when the wall clock has stepped.
+    resyncBaseTime();
 
     // Enable streaming record parsing on the transport so a large DATA_BUF
     // response is decoded incrementally as BLE notifications arrive, instead

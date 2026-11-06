@@ -322,8 +322,10 @@ class DataItem
         DataItemType type = TYPE_UNKNOWN; // Item type for identification
 
         // Raw DATA_BUF record header, preserved for diagnostics / debugging.
-        // ts_offset is in 0.01-second units relative to the device's pinned
-        // clock; record time = host_now_at_read + ts_offset*10 ms.
+        // ts_offset is in 0.01-second units relative to the device's clock
+        // base pinned at connect; record time = host_now_at_connect +
+        // ts_offset*10 ms (+128 s for live RealTimeData, gid 0). The base is
+        // re-anchored by resyncBaseTime() if the host wall clock steps.
         int32_t ts_offset = 0;
         uint8_t eid = 0;
         uint8_t gid = 0;

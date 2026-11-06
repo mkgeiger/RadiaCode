@@ -66,6 +66,9 @@ class RadiaCode
 
         // Data acquisition methods
         std::vector<DataItem*> dataBuf(void);
+        // Re-anchor the DATA_BUF base time after a wall-clock step (GPS/RTC
+        // sync) so record timestamps stay aligned with the host clock.
+        void resyncBaseTime(void);
         Spectrum spectrum(void);
         Spectrum spectrumAccum(void);
 
@@ -145,6 +148,7 @@ class RadiaCode
         uint8_t _seq;
         bool _bt_supported;
         uint32_t _base_time_sec;
+        int64_t _base_mono_us;  // esp_timer at connect, to detect clock steps
         uint8_t _spectrum_format_version;
 };
 
