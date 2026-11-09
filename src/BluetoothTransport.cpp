@@ -55,6 +55,7 @@ BluetoothTransport::BluetoothTransport(const char* mac)
     _parse_data_buf = false;
     _base_time_sec = 0;
     _header_skipped = false;
+    _realtime_size = 0;
     // Initialize the buffer to zeros
     memset(_resp_buffer, 0, MAX_RESP_SIZE);
 
@@ -326,6 +327,7 @@ void BluetoothTransport::setDataBufStream(uint32_t base_time_sec)
 {
     _parse_data_buf = true;
     _base_time_sec = base_time_sec;
+    _realtime_size = 0; // re-detect the RealTimeData body size for this buffer
 }
 
 std::vector<DataItem*> BluetoothTransport::drainDataBufRecords(void)
@@ -436,6 +438,30 @@ void BluetoothTransport::parseAvailableRecords(void)
         _header_skipped = true;
     }
 
+    // Resolve the RealTimeData (gid 0) body size (15 = fw <= 4.14, 16 = fw
+    // 4.15).  While undetected, probe the buffered bytes each pass and lock the
+    // choice in only once the buffer actually distinguishes the two sizes;
+    // until then decode tentatively (a wrong guess costs one record, the
+    // resync path recovers alignment).
+    if (_realtime_size == 0)
+    {
+        bool conclusive = false;
+        int rt = detectRealtimeSize(_resp_buffer, _buf_len, &conclusive);
+        if (conclusive)
+        {
+            _realtime_size = rt;
+            RC_LOGD("DATA_BUF: RealTimeData body size detected: %d bytes (%s)",
+                    rt, (rt == RADIACODE_RT_NEW_SIZE) ? "firmware 4.15+" : "firmware <= 4.14");
+        }
+#ifdef BT_DEBUG_INFO
+        else
+        {
+            RC_LOGI("DATA_BUF: RealTimeData size still undetermined (tentative %d), %zu bytes buffered", rt, _buf_len);
+        }
+#endif
+    }
+    const int rt_size = (_realtime_size != 0) ? _realtime_size : RADIACODE_RT_LEGACY_SIZE;
+
     while (_buf_len > 0)
     {
         if (_buf_len < 7)
@@ -445,13 +471,13 @@ void BluetoothTransport::parseAvailableRecords(void)
 
         BytesBuffer br(_resp_buffer, _buf_len);
         std::vector<DataItem*> items;
-        size_t consumed_bytes = decodeDataBufRecord(br, _base_time_sec, items);
+        size_t consumed_bytes = decodeDataBufRecord(br, _base_time_sec, items, rt_size);
         if (consumed_bytes == 0)
         {
             // A full 7-byte header was present but the record failed to decode:
             // assume it is corrupt and re-sync to the next plausible record so
             // one glitch does not discard the rest of the stream.
-            if (!resyncDataBuf(br))
+            if (!resyncDataBuf(br, rt_size))
             {
                 break; // need more data, or no further plausible record
             }

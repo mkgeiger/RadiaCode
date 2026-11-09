@@ -28,6 +28,7 @@
 
 #include "esp_log.h"
 static const char RC_LOG_TAG[] = "RadiaCode";
+#define RC_LOGD(fmt, ...) ESP_LOGD(RC_LOG_TAG, fmt, ##__VA_ARGS__)
 #define RC_LOGI(fmt, ...) ESP_LOGI(RC_LOG_TAG, fmt, ##__VA_ARGS__)
 #define RC_LOGW(fmt, ...) ESP_LOGW(RC_LOG_TAG, fmt, ##__VA_ARGS__)
 #define RC_LOGE(fmt, ...) ESP_LOGE(RC_LOG_TAG, fmt, ##__VA_ARGS__)
@@ -35,12 +36,14 @@ static const char RC_LOG_TAG[] = "RadiaCode";
 #elif defined(ARDUINO_ARCH_ESP32)
 
 #include "Arduino.h"
+#define RC_LOGD(fmt, ...)
 #define RC_LOGI(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
 #define RC_LOGW(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
 #define RC_LOGE(fmt, ...) Serial.printf(fmt "\n", ##__VA_ARGS__)
 
 #else
 
+#define RC_LOGD(fmt, ...)
 #define RC_LOGI(fmt, ...)
 #define RC_LOGW(fmt, ...)
 #define RC_LOGE(fmt, ...)

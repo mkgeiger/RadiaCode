@@ -70,6 +70,7 @@ class BluetoothTransport : public RadiaCodeTransport
         bool _parse_data_buf;
         uint32_t _base_time_sec;
         bool _header_skipped;               // 12-byte protocol header consumed
+        int _realtime_size;                 // RealTimeData body size; 0 = not yet detected
         std::vector<DataItem*> _parsed_records;
 
         // Append incoming notification bytes to the buffer, then try to parse

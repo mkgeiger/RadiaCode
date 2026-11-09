@@ -283,6 +283,8 @@ void decodeSpectrum(BytesBuffer& br, uint8_t format_version, Spectrum& spectrum)
 // Payload sizes (bytes after the 7-byte header) for single-sample records,
 // keyed by gid.  These come from the authoritative python decoder:
 // gid 0 '<ffHHHB'(15), 1 '<ff'(8), 2 '<IffHH'(16), 3 '<IfHHH'(14), 4 '<IH'(6).
+// gid 0 (RealTimeData) is overridden by the detected `realtime_size`: firmware
+// 4.15 appends one byte after rt_flags, growing the body from 15 to 16 bytes.
 static const uint8_t gid0_single_payload[5] = {15, 8, 16, 14, 6};
 // Per-sample payload size for multi-sample groups (eid==1), keyed by gid:
 // 1 '<ff'(8), 2 '<IffHH'(16), 3 '<IfHHH'(14), 4 '<IH'(6).
@@ -318,8 +320,9 @@ static bool isCountRateEvent(uint8_t event)
 // Return the body size (bytes after the 7-byte header) of a plausible record
 // whose header is at `off` in `data[0..n)`, or 0 if it does not look like a
 // valid record.  Mirrors the python reference `_record_size` so a corrupt
-// record can be re-synced past.
-static size_t recordBodySize(const uint8_t* data, size_t n, size_t off)
+// record can be re-synced past.  `realtime_size` is the RealTimeData (gid 0)
+// body size (15 or 16, see detectRealtimeSize).
+static size_t recordBodySize(const uint8_t* data, size_t n, size_t off, int realtime_size)
 {
     if (off + 7 > n)
     {
@@ -333,10 +336,14 @@ static size_t recordBodySize(const uint8_t* data, size_t n, size_t off)
     {
         if (gid <= 4)
         {
-            size = gid0_single_payload[gid];
+            size = (gid == 0) ? (size_t)realtime_size : gid0_single_payload[gid];
         }
         else if (gid == 7)
         {
+            if (off + 8 > n)
+            {
+                return 0; // event byte is at off+7; the 7-byte header alone is not enough
+            }
             uint8_t event = data[off + 7];
             size = 4 + (isRateEvent(event) ? 6 : 0);
         }
@@ -380,12 +387,89 @@ static size_t recordBodySize(const uint8_t* data, size_t n, size_t off)
     return size;
 }
 
+// Strictly walk `data` assuming a RealTimeData body of `realtime_size`.
+// Sets `exact` when the walk lands exactly on the end of the buffer (all
+// records well-formed) and `nrec` to the number of records decoded before the
+// first malformed/truncated one.
+struct ProbeResult
+{
+    bool exact;
+    size_t nrec;
+};
+
+static ProbeResult probeDataBuf(const uint8_t* data, size_t n, int realtime_size)
+{
+    size_t off = 0;
+    size_t nrec = 0;
+    while (true)
+    {
+        size_t size = recordBodySize(data, n, off, realtime_size);
+        if (size == 0)
+        {
+            ProbeResult r = {false, nrec};
+            return r;
+        }
+        off += 7 + size;
+        nrec++;
+        if (off >= n)
+        {
+            ProbeResult r = {off == n, nrec};
+            return r;
+        }
+    }
+}
+
+int detectRealtimeSize(const uint8_t* data, size_t n, bool* conclusive)
+{
+    if (n < 7)
+    {
+        if (conclusive) *conclusive = false;
+        return RADIACODE_RT_LEGACY_SIZE;
+    }
+    ProbeResult r15 = probeDataBuf(data, n, RADIACODE_RT_LEGACY_SIZE);
+    ProbeResult r16 = probeDataBuf(data, n, RADIACODE_RT_NEW_SIZE);
+
+    int size;
+    bool concl;
+    if (r15.exact && !r16.exact)
+    {
+        size = RADIACODE_RT_LEGACY_SIZE;
+        concl = true;
+    }
+    else if (r16.exact && !r15.exact)
+    {
+        size = RADIACODE_RT_NEW_SIZE;
+        concl = true;
+    }
+    else if (r15.exact && r16.exact)
+    {
+        // No RealTimeData record in this buffer: both sizes parse identically
+        // and the choice is irrelevant *for this buffer*.  A streaming caller
+        // may still see RealTimeData records later, so this is not conclusive.
+        size = RADIACODE_RT_LEGACY_SIZE;
+        concl = false;
+    }
+    else
+    {
+        // Corrupt or truncated buffer (neither size reaches the end): the size
+        // that decoded more records wins.
+        size = (r15.nrec >= r16.nrec) ? RADIACODE_RT_LEGACY_SIZE : RADIACODE_RT_NEW_SIZE;
+        concl = false;
+    }
+#ifdef DEC_DEBUG_INFO
+    RC_LOGI("RealTimeData size probe: n=%zu probe15(exact=%d,nrec=%zu) probe16(exact=%d,nrec=%zu) -> %d (conclusive=%d)",
+            n, (int)r15.exact, r15.nrec, (int)r16.exact, r16.nrec, size, (int)concl);
+#endif
+    if (conclusive) *conclusive = concl;
+    return size;
+}
+
 // After a malformed record, scan forward for the next plausible record header
 // and reposition the buffer there.  Returns true if a re-sync point was found,
 // leaving the buffer positioned at that record's header.  A candidate is only
 // accepted if the record parses *and* is followed by another plausible record,
 // which rejects most false positives in garbage.
-bool resyncDataBuf(BytesBuffer& br)
+bool resyncDataBuf(BytesBuffer& br, int realtime_size)
 {
     size_t start = br.getPosition();
     const uint8_t* data = br.getData();
@@ -399,14 +483,17 @@ bool resyncDataBuf(BytesBuffer& br)
     size_t limit = std::min(start + max_scan, n - 7);
     for (size_t off = start + 1; off < limit; off++)
     {
-        size_t size = recordBodySize(data, n, off);
+        size_t size = recordBodySize(data, n, off, realtime_size);
         if (size == 0)
         {
             continue;
         }
         size_t end = off + 7 + size;
-        if (recordBodySize(data, n, end) != 0)
+        if (recordBodySize(data, n, end, realtime_size) != 0)
         {
+#ifdef DEC_DEBUG_INFO
+            RC_LOGI("DATA_BUF resync: skipped %zu bytes of garbage, next record at %zu", off - start, off);
+#endif
             br.setPosition(off);
             return true;
         }
@@ -418,7 +505,8 @@ bool resyncDataBuf(BytesBuffer& br)
 #define REC_NEED(bytes) \
     do { if (br.available() < (bytes)) { br.setPosition(rec_pos); return 0; } } while (0)
 
-size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<DataItem*>& out)
+size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<DataItem*>& out,
+                           int realtime_size)
 {
     // We need at least the 7-byte record header before we can do anything.
     if (br.available() < 7)
@@ -459,9 +547,9 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
     {
         switch (gid)
         {
-        case 0: // GRP_RealTimeData '<ffHHHB' (15 bytes)
+        case 0: // GRP_RealTimeData '<ffHHHB' (15 bytes; fw 4.15 appends 1 more)
         {
-            REC_NEED(15);
+            REC_NEED(realtime_size);
             RealTimeData* data = new RealTimeData();
             data->timestamp = timestamp;
             data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
@@ -474,10 +562,16 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
                 br.setPosition(rec_pos);
                 return 0;
             }
+            // firmware 4.15 appends one further byte after rt_flags; consume it
+            // so the next record stays aligned (its meaning is undetermined).
+            if (realtime_size > RADIACODE_RT_LEGACY_SIZE)
+            {
+                br.setPosition(br.getPosition() + (realtime_size - RADIACODE_RT_LEGACY_SIZE));
+            }
             data->count_rate_err = cr_err / 10.0f;
             data->dose_rate_err = dr_err / 10.0f;
             out.push_back(data);
-            return 7 + 15;
+            return 7 + realtime_size;
         }
         case 1: // GRP_RawData '<ff' (8 bytes)
         {
@@ -648,8 +742,8 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             return 0;
         }
         uint16_t samples_num;
-        uint32_t smpl_time_ms;
-        if (!br.readUint16(&samples_num) || !br.readUint32(&smpl_time_ms))
+        uint32_t smpl_time;
+        if (!br.readUint16(&samples_num) || !br.readUint32(&smpl_time))
         {
             br.setPosition(rec_pos);
             return 0;
@@ -661,13 +755,28 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             return 0; // body does not fit -> malformed record
         }
 
+        // `smpl_time` is the interval between consecutive samples, in the same
+        // 10 ms units as ts_offset (verified: a DoseRateDB block tiles the
+        // single-sample grid exactly at smpl_time*10 ms). The samples run oldest
+        // to newest starting at the group timestamp, so sample i is at
+        // record_ms + i*smpl_time*10ms rather than all sharing the group time.
+        const int64_t step_ms = (int64_t)smpl_time * 10;
+#ifdef DEC_DEBUG_INFO
+        RC_LOGI("DATA_BUF multi eid=1 gid=%u: samples=%u smpl_time=%lu (step %lld ms), base ts=%lu.%03u",
+                (unsigned)gid, (unsigned)samples_num, (unsigned long)smpl_time,
+                (long long)step_ms, (unsigned long)timestamp, timestamp_ms);
+#endif
+
         for (uint16_t i = 0; i < samples_num; i++)
         {
+            int64_t sample_ms = record_ms + (int64_t)i * step_ms;
+            uint32_t s_timestamp = (uint32_t)(sample_ms / 1000);
+            uint16_t s_timestamp_ms = (uint16_t)(((sample_ms % 1000) + 1000) % 1000);
             if (gid == 1) // GRP_RawData
             {
                 RawData* data = new RawData();
-                data->timestamp = timestamp;
-                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
+                data->timestamp = s_timestamp;
+                data->timestamp_ms = s_timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 if (!br.readFloat(&data->count_rate) || !br.readFloat(&data->dose_rate))
                 {
                     delete data;
@@ -679,8 +788,8 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             else if (gid == 2) // GRP_DoseRateDB
             {
                 DoseRateDB* data = new DoseRateDB();
-                data->timestamp = timestamp;
-                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
+                data->timestamp = s_timestamp;
+                data->timestamp_ms = s_timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 uint16_t dr_err;
                 if (!br.readUint32(&data->count) || !br.readFloat(&data->count_rate) ||
                     !br.readFloat(&data->dose_rate) || !br.readUint16(&dr_err) ||
@@ -696,8 +805,8 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             else if (gid == 3) // GRP_RareData
             {
                 RareData* data = new RareData();
-                data->timestamp = timestamp;
-                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
+                data->timestamp = s_timestamp;
+                data->timestamp_ms = s_timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 uint16_t temperature_raw, charge_raw;
                 if (!br.readUint32(&data->duration) || !br.readFloat(&data->dose) ||
                     !br.readUint16(&temperature_raw) || !br.readUint16(&charge_raw) ||
@@ -714,8 +823,8 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
             else if (gid == 4) // GRP_DoseCounter
             {
                 DoseCounter* data = new DoseCounter();
-                data->timestamp = timestamp;
-                data->timestamp_ms = timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
+                data->timestamp = s_timestamp;
+                data->timestamp_ms = s_timestamp_ms; data->ts_offset = ts_offset; data->eid = eid; data->gid = gid;
                 if (!br.readUint32(&data->dose_counter) || !br.readUint16(&data->flags))
                 {
                     delete data;
@@ -735,13 +844,20 @@ size_t decodeDataBufRecord(BytesBuffer& br, uint32_t base_time_sec, std::vector<
     }
 }
 
-std::vector<DataItem*> decodeDataBuf(BytesBuffer& br, uint32_t base_time_sec)
+std::vector<DataItem*> decodeDataBuf(BytesBuffer& br, uint32_t base_time_sec, int realtime_size)
 {
     std::vector<DataItem*> ret;
 
+    if (realtime_size == 0)
+    {
+        // Auto-detect the RealTimeData body size from the remaining buffer so
+        // one decoder handles both firmware <= 4.14 (15) and 4.15 (16).
+        realtime_size = detectRealtimeSize(br.getData() + br.getPosition(), br.available(), nullptr);
+    }
+
     while (true)
     {
-        size_t consumed = decodeDataBufRecord(br, base_time_sec, ret);
+        size_t consumed = decodeDataBufRecord(br, base_time_sec, ret, realtime_size);
         if (consumed > 0)
         {
             continue;
@@ -757,7 +873,7 @@ std::vector<DataItem*> decodeDataBuf(BytesBuffer& br, uint32_t base_time_sec)
         // A full 7-byte header was present but decoding failed: assume the
         // record is corrupt and re-sync to the next plausible record so a
         // single glitch does not discard the rest of the buffer.
-        if (!resyncDataBuf(br))
+        if (!resyncDataBuf(br, realtime_size))
         {
             break; // no further plausible record found
         }
